@@ -1,47 +1,89 @@
 import csv
 import os
-import scrapy
 import time
 
 from datetime import datetime
-from scrapy import Spider
+from scrapy import Selector
 from selenium import webdriver
 
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
+from scrapy.spiders import CrawlSpider, Request, Spider
+
 from ...utils import (
+    exception_handler,
     get_adverts_for_takendown,
     get_missing_seller_url,
-    handle_errors,
     insert_region_and_country,
     scraper_url_list,
     unique_list_of_product,
     update_last_seen,
     update_sellers,
     write_to_excel,
+    get_today_date
 )
 
 
-class PoshmarkUSSpider(Spider):
-    """Spider for scraping Poshmark US website."""
+class PoshmarkParser(Spider):
+    name = "poshmark-parser"
+
+    @exception_handler
+    def parse(self, response, **kwargs):
+        """Parse individual product details"""
+
+        parse_product = {
+            "seller": "poshmark",
+            "company_id": kwargs.get("company_id"),
+            "keyword": kwargs.get("keyword"),
+
+            "region": "NA",
+            "country": "United States", 
+            "domain": "poshmark.com",
+
+            "currency": "USD",
+            "shipping_address": "",
+            "created_at": get_today_date(),
+
+            "url": response.url,
+            "title": self.get_title(response),
+            "description": self.get_description(response),
+            "price": self.get_price(response),
+            "pic": self.get_image(response)
+        }
+
+        PoshmarkCrawler.products.append(parse_product)
+
+    def get_product_title(self, response):
+        product_title = response.css(".listing__title h1::text").get()
+        return product_title.strip() if product_title else ""
+
+    def get_product_description(self, response):
+        product_description = response.css(".listing__description ::text").get()
+        return product_description.strip() if product_description else ""
+
+    def get_product_price(self, response):
+        product_price = response.css(".listing__ipad-centered p::text").get()
+        return product_price.strip() if product_price else ""
+
+    def get_product_image(self, response):
+        product_image = response.css(".carousel__inner img::attr(src)").get()
+        return product_image or ""
+
+
+class PoshmarkCrawler(CrawlSpider):
+    """Crawler for Poshmark website"""
 
     name = "PoshmarkUSSpider"
     allowed_domains = ["poshmark.com"]
     base_url = "https://poshmark.com"
-    domain = "poshmark.com"
-    region = "NA"
-    country = "United States" 
-    seller = "poshmark"
 
-    # Initialize tracking lists
+    parser = PoshmarkParser()
+
     products = []
     taken_down_list = []
     missing_seller_list = []
-
-    # Register region and country
-    insert_region_and_country(region, country)
 
     custom_settings = {
         "AUTOTHROTTLE_ENABLED": True,
@@ -55,124 +97,99 @@ class PoshmarkUSSpider(Spider):
     }
 
     def __init__(self, *args, **kwargs):
-        """Initialize spider with webdriver."""
-
         super().__init__(*args, **kwargs)
+
         self.driver = self.get_driver()
         self.driver.implicitly_wait(180)
+        insert_region_and_country("NA", "United States")
 
     @staticmethod
     def get_driver():
-        """Configure and return Chrome webdriver."""
-
         options = webdriver.ChromeOptions()
         options.add_argument("--headless")
-        options.add_argument("--no-sandbox")
+        options.add_argument("--no-sandbox") 
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--incognito")
 
         return webdriver.Chrome(options=options)
 
     def start_requests(self):
-        """Initialize scraping requests."""
+        """Initialize scraping requests"""
 
-        search_urls = scraper_url_list("https://poshmark.com/search?query={0}&type=listings&src=dir")
-        for url_data in search_urls:
-            regions = url_data.get("regions", "").split(", ") if url_data.get("regions") else []
-            countries = url_data.get("countries", "").split(", ") if url_data.get("countries") else []
+        poshmark_search_url = "https://poshmark.com/search?query={0}&type=listings&src=dir"
+        search_url_variations = scraper_url_list(poshmark_search_url)
+        
+        for obj in search_url_variations:
+            regions = obj.get("regions", "").split(", ") if obj.get("regions") else []
+            countries = obj.get("countries", "").split(", ") if obj.get("countries") else []
+
+            should_crawl = (
+                not regions and not countries or 
+                "NA" in regions or 
+                "United States" in countries
+            )
+
+            if not should_crawl:
+                continue
             
-            scrape_all = not regions and not countries
-            region_match = self.region in regions
-            country_match = self.country in countries
-
-            if scrape_all or region_match or country_match:
-                yield scrapy.Request(
-                    url=url_data["url"],
-                    callback=self.parse,
-                    cb_kwargs={
-                        "company_id": url_data["company_id"],
-                        "keyword": url_data["keyword"],
-                    },
-                    dont_filter=True,
-                )
-
-        self._handle_missing_seller_urls()
-        self._handle_taken_down_adverts()
-    
-    def _handle_missing_seller_urls(self):
-        """Process URLs with missing seller info."""
-
-        missing_seller_urls = get_missing_seller_url(domain=self.domain)
-        for url in missing_seller_urls:
-
-            yield scrapy.Request(
-                url=url,
-                callback=self.parse_missing_seller,
-                meta={"missing_seller": True},
+            yield Request(
+                url=obj.get("url"),
+                callback=self.crawl_poshmark_products,
+                cb_kwargs={
+                    "company_id": obj.get("company_id"),
+                    "keyword": obj.get("keyword"),
+                },
+                dont_filter=True
             )
 
-    def _handle_taken_down_adverts(self):
-        """Process taken down advertisements."""
+        yield from self._handle_missing_seller_urls()
+        yield from self._handle_taken_down_adverts()
 
-        taken_down_adverts = get_adverts_for_takendown(domain=self.domain)
-        for advert in taken_down_adverts:
-            advert_id, product, url = advert
-
-            yield scrapy.Request(
-                url=url,
-                callback=self.parse_product_detail,
-                meta={"advert_id": advert_id, "product": product},
-            )
-    
-    def parse(self, response, **kwargs):
-        """Parse search results with infinite scroll handling."""
-
+    def crawl_poshmark_products(self, response, **kwargs):
         self.driver.get(response.url)
         
-        try:
-            WebDriverWait(self.driver, 10).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, ".grid-page .item__details"))
+        poshmark_products_css = ".grid-page .item__details"
+        poshmark_products_locator = (By.CSS_SELECTOR, poshmark_products_css)
+
+        # Wait for the product elements to load
+        webdriver_wait = WebDriverWait(self.driver, 10)
+        if not webdriver_wait.until(EC.presence_of_element_located(poshmark_products_locator)):
+            self.logger.error("Could not find product elements on page")
+            self.driver.quit()
+            return
+
+        self._scroll_page()
+        
+        # Get the product elements
+        poshmark_products = Selector(text=self.driver.page_source).css(poshmark_products_css)
+        if not poshmark_products:
+            self.logger.error("No products found after scrolling")
+            self.driver.quit()
+            return
+
+        # Iterate over the products and yield requests for each product
+        for product in poshmark_products:
+            product_url = product.css("a::attr(href)").get()
+            if not product_url:
+                continue
+                
+            if not product_url.startswith("http"):
+                product_url = self.base_url + product_url
+                
+            yield Request(
+                url=product_url,
+                callback=self.parser.parse,
+                cb_kwargs={
+                    "company_id": kwargs.get("company_id"),
+                    "keyword": kwargs.get("keyword"),
+                },
+                dont_filter=True
             )
 
-            self._scroll_page()
-
-            response_data = scrapy.Selector(text=self.driver.page_source)
-            for product in response_data.css(".grid-page .item__details"):
-                listing = {
-                    "seller": self.seller,
-                    "region": self.region,
-                    "country": self.country,
-                    "domain": self.domain,
-                    "currency": "USD",
-                    "keyword": kwargs.get("keyword"),
-                    "company_id": kwargs.get("company_id"),
-                    "created_at": datetime.now().strftime("%d-%m-%Y"),
-                    "shipping_address": ""
-                }
-                
-                product_url = product.css("a::attr(href)").get()
-                if product_url:
-                    if not product_url.startswith("http"):
-                        product_url = response.urljoin(product_url)
-
-                    listing["url"] = product_url
-
-                    yield scrapy.Request(
-                        url=listing["url"],
-                        callback=self.parse_product_detail,
-                        cb_kwargs=kwargs,
-                        meta={"listing": listing},
-                        dont_filter=True
-                    )
-
-        except Exception as e:
-            self.logger.error(f"Error during parsing: {str(e)}")
-            
-        finally:
-            self.driver.quit()
+        self.driver.quit()
 
     def _scroll_page(self):
-        """Handle infinite scrolling of the page."""
+        """Handle infinite scrolling"""
 
         last_height = self.driver.execute_script("return document.body.scrollHeight")            
         products_count = 0
@@ -195,28 +212,31 @@ class PoshmarkUSSpider(Spider):
             products_count = len(products)
             scroll_attempts += 1
 
-    @handle_errors 
-    def parse_product_detail(self, response, **kwargs):
-        """Parse individual product details."""
+    def _handle_missing_seller_urls(self):
+        """Process URLs with missing seller info"""
 
-        product_title = response.css(".listing__title h1::text").get()
-        product_description = response.css(".listing__description ::text").get()
-        product_price = response.css(".listing__ipad-centered p::text").get()
-        product_image = response.css(".carousel__inner img::attr(src)").get()
+        missing_seller_urls = get_missing_seller_url(domain="poshmark.com")
+        for url in missing_seller_urls:
+            yield Request(
+                url=url,
+                callback=self.parser.parse,
+                meta={"missing_seller": True}
+            )
 
-        listing = response.meta["listing"]
-        listing.update({
-            "title": product_title.strip() if product_title else "",
-            "description": product_description.strip() if product_description else "",
-            "price": product_price.strip() if product_price else "",
-            "pic": product_image if product_image else ""
-        })
+    def _handle_taken_down_adverts(self):
+        """Process taken down advertisements"""
 
-        self.products.append(listing)
+        taken_down_adverts = get_adverts_for_takendown(domain="poshmark.com")
+        for advert in taken_down_adverts:
+            advert_id, product, url = advert
+            yield Request(
+                url=url,
+                callback=self.parser.parse,
+                meta={"advert_id": advert_id, "product": product}
+            )
 
     def closed(self, reason):
-        """Handle spider shutdown and data export."""
-
+        """Handle spider shutdown and data export"""
         output_dir = 'outputs'
         os.makedirs(output_dir, exist_ok=True)
 
@@ -233,10 +253,10 @@ class PoshmarkUSSpider(Spider):
         write_to_excel(
             spider_name=self.name,
             products=unique_products,
-            domain=self.domain,
-            region=self.region,
-            country=self.country,
-            seller=self.seller,
+            domain="poshmark.com",
+            region="NA",
+            country="United States",
+            seller="poshmark",
         )
 
         if self.taken_down_list:
@@ -244,4 +264,3 @@ class PoshmarkUSSpider(Spider):
 
         if self.missing_seller_list:
             update_sellers(self.missing_seller_list)
-
